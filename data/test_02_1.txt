@@ -1,0 +1,7 @@
+VIN                Make           Model                Year  Price     
+-----------------------------------------------------------------------
+1HGCM82633A004352  Honda          Accord LX            2003  0015000.00
+1FTFW1ET5EKF51234  Ford           F-150 XLT            2014  0027500.50
+2T3ZF4DV7AW087256  Toyota         RAV4                 2010  0016500.00
+1C4PJLCB3KD105698  Jeep           Cherokee Latitude    2019  0032000.75
+5NPE24AF3FH004153  Hyundai        Sonata SE            2015  0019800.25
