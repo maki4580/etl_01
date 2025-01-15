@@ -1390,3 +1390,472 @@ GET /api/generateExcel
 
 以上が、Markdown形式でのAPI仕様書です。
 ご不明な点がございましたら、お気軽にご質問ください。
+
+=======
+
+Next.jsとExcelJSを使用して、以下の２つのAPIを実装する。
+機能1：Excelに入力された商品の注文数の一覧データをPostgreSQLに登録する。
+機能2：PostgreSQLから商品の注文状況の一覧をExcelに出力する。
+
+このプログラムは、3層アーキテクチャ（MVC）で作成する。
+機能1について、以下とする。
+・WebページからExcelファイルを指定し、指定されたExcelファイルはAmazon S3のuploadsプレフィックスに配置する。
+・uploadsプレフィックスに配置されたExcelファイルを取得してPostgreSQLにデータ登録する。
+・データ登録後は、ExcelファイルをAmazon S3のfinishedプレフィックスに配置する。
+機能2について、以下とする。
+・出力する際、Excelのレコード数に応じて一覧の罫線を引く。
+・出力するExcelは、特定の列のデータのみ入力可能とし、それ以外のセルはロックされている状態で出力する。
+・出力するExcelの入力可能セルは背景色を薄黄色に設定する。
+
+-------
+
+**ディレクトリ構成**
+
+```
+my-excel-app/
+├── components/
+│   └── FileUpload.js
+├── controllers/
+│   └── excelController.js
+├── models/
+│   └── orderModel.js
+├── services/
+│   ├── excelService.js
+│   └── s3Service.js
+├── pages/
+│   └── api/
+│       └── excel.js
+├── .env
+├── ...
+└── package.json
+```
+
+**1. 環境変数設定 (.env)**
+
+```env
+DATABASE_URL=postgresql://your_user:your_password@your_host:your_port/your_database
+AWS_ACCESS_KEY_ID=your_access_key_id
+AWS_SECRET_ACCESS_KEY=your_secret_access_key
+AWS_REGION=your_region
+AWS_BUCKET_NAME=your_bucket_name
+```
+
+**2. モデル (models/orderModel.js)**
+
+```javascript
+// models/orderModel.js
+import { Pool } from 'pg';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+export const createOrderTable = async () => {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        product_name VARCHAR(255) NOT NULL,
+        quantity INTEGER NOT NULL,
+        order_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+  } finally {
+    client.release();
+  }
+};
+
+
+export const insertOrders = async (orders) => {
+  const client = await pool.connect();
+  try {
+      await createOrderTable();
+      const query = `
+      INSERT INTO orders (product_name, quantity) VALUES
+      ${orders.map((_, index) => `($${index * 2 + 1}, $${index * 2 + 2})`).join(',')}
+    `;
+    const values = orders.flatMap(order => [order.product_name, order.quantity]);
+    await client.query(query, values);
+  } finally {
+      client.release();
+  }
+};
+
+export const fetchOrders = async () => {
+  const client = await pool.connect();
+  try {
+    await createOrderTable();
+    const result = await client.query('SELECT id, product_name, quantity, order_date FROM orders');
+    return result.rows;
+  } finally {
+    client.release();
+  }
+};
+```
+
+**3. S3サービス (services/s3Service.js)**
+
+```javascript
+// services/s3Service.js
+import AWS from 'aws-sdk';
+
+AWS.config.update({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION,
+});
+
+const s3 = new AWS.S3();
+const bucketName = process.env.AWS_BUCKET_NAME;
+
+const uploadFileToS3 = async (file, prefix) => {
+    const params = {
+      Bucket: bucketName,
+      Key: `${prefix}/${file.originalname}`,
+      Body: file.buffer,
+    };
+    return s3.upload(params).promise();
+  };
+
+const getFileFromS3 = async (key) => {
+  const params = {
+    Bucket: bucketName,
+    Key: key,
+  };
+  return s3.getObject(params).promise();
+};
+
+const moveFileInS3 = async (sourceKey, destinationKey) => {
+  await s3.copyObject({
+    Bucket: bucketName,
+    CopySource: `/${bucketName}/${sourceKey}`,
+    Key: destinationKey,
+  }).promise();
+
+  await s3.deleteObject({
+    Bucket: bucketName,
+    Key: sourceKey,
+  }).promise();
+};
+
+export { uploadFileToS3, getFileFromS3, moveFileInS3 };
+```
+
+**4. Excelサービス (services/excelService.js)**
+
+```javascript
+// services/excelService.js
+import ExcelJS from 'exceljs';
+
+const INPUTABLE_COLUMN_INDEX = 2;
+const HEADER = ["ID", "商品名", "注文数", "注文日時"];
+
+const parseExcelData = async (buffer) => {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer);
+    const worksheet = workbook.getWorksheet(1);
+    const rows = [];
+    worksheet.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return; // ヘッダー行をスキップ
+       const rowValues = row.values;
+        rows.push({
+            product_name: rowValues[1],
+            quantity: rowValues[2],
+        });
+    });
+    return rows;
+};
+
+
+const createExcelFromData = async (orders) => {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('注文一覧');
+  worksheet.columns = HEADER.map(header => ({ header, key: header.toLowerCase() }));
+  worksheet.addRow(HEADER);
+
+  orders.forEach(order => {
+    worksheet.addRow({
+      id: order.id,
+      product_name: order.product_name,
+      quantity: order.quantity,
+      order_date: order.order_date
+    });
+  });
+
+  // 行数に合わせて罫線を設定
+  const lastRow = worksheet.lastRow.number;
+    for (let i = 1; i <= lastRow; i++) {
+        worksheet.getRow(i).eachCell((cell) => {
+            cell.border = {
+                top: { style: 'thin' },
+                left: { style: 'thin' },
+                bottom: { style: 'thin' },
+                right: { style: 'thin' }
+            };
+        });
+    }
+
+
+  // 特定列のみ入力可能にし、背景色を設定、その他をロック
+  worksheet.eachRow({ includeEmpty: true }, (row) => {
+    row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+      if (colNumber === INPUTABLE_COLUMN_INDEX) {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFFFFFE0' },
+        };
+        cell.protection = { locked: false };
+      } else {
+        cell.protection = { locked: true };
+      }
+    });
+  });
+
+  // シートを保護
+  worksheet.protect('password', {
+    selectLockedCells: true,
+    selectUnlockedCells: true,
+    formatCells: false,
+    formatColumns: false,
+    formatRows: false,
+    insertColumns: false,
+    insertRows: false,
+    insertHyperlinks: false,
+    deleteColumns: false,
+    deleteRows: false,
+    sort: false,
+    autoFilter: false,
+    pivotTables: false,
+    objects: false,
+    scenarios: false,
+  });
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    return buffer;
+};
+
+export { parseExcelData, createExcelFromData };
+```
+
+**5. コントローラ (controllers/excelController.js)**
+
+```javascript
+// controllers/excelController.js
+import { insertOrders, fetchOrders } from '../models/orderModel';
+import { getFileFromS3, uploadFileToS3, moveFileInS3 } from '../services/s3Service';
+import { parseExcelData, createExcelFromData } from '../services/excelService';
+
+const uploadAndProcessExcel = async (req, res) => {
+  try {
+      if (!req.file) {
+          return res.status(400).json({ message: 'No file uploaded' });
+      }
+
+      await uploadFileToS3(req.file, 'uploads');
+      const fileKey = `uploads/${req.file.originalname}`;
+      const s3Object = await getFileFromS3(fileKey);
+      const excelData = await parseExcelData(s3Object.Body);
+
+      await insertOrders(excelData);
+      const destinationKey = `finished/${req.file.originalname}`;
+      await moveFileInS3(fileKey, destinationKey);
+
+
+      res.status(200).json({ message: 'File uploaded and processed successfully' });
+  } catch (error) {
+    console.error('Error processing file:', error);
+    res.status(500).json({ error: 'Failed to process file' });
+  }
+};
+
+const getExcel = async (req, res) => {
+  try {
+    const orders = await fetchOrders();
+      if (!orders || orders.length === 0) {
+        return res.status(404).json({ message: "No orders found" });
+    }
+    const buffer = await createExcelFromData(orders);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="orders.xlsx"');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error creating Excel:', error);
+    res.status(500).json({ error: 'Failed to create Excel' });
+  }
+};
+
+
+export { uploadAndProcessExcel, getExcel };
+```
+
+**6. API エンドポイント (pages/api/excel.js)**
+
+```javascript
+// pages/api/excel.js
+import { uploadAndProcessExcel, getExcel } from '../../controllers/excelController';
+import multer from 'multer';
+import nextConnect from 'next-connect';
+
+const upload = multer({ storage: multer.memoryStorage() });
+const uploadMiddleware = upload.single('file');
+
+
+const handler = nextConnect({
+    onError: (err, req, res, next) => {
+        console.error(err.stack);
+        res.status(500).json({ error: 'Something broke!'});
+    },
+    onNoMatch: (req, res) => {
+        res.status(404).json({ error: 'Not found' });
+    }
+})
+.use(uploadMiddleware)
+.post(async (req, res) => {
+    await uploadAndProcessExcel(req,res);
+})
+.get(async (req, res) => {
+    await getExcel(req,res);
+});
+
+export default handler;
+
+
+export const config = {
+    api: {
+        bodyParser: false,
+    }
+}
+```
+
+**7. ファイルアップロードコンポーネント (components/FileUpload.js)**
+
+```jsx
+// components/FileUpload.js
+import { useState } from 'react';
+
+const FileUpload = () => {
+  const [file, setFile] = useState(null);
+  const [message, setMessage] = useState('');
+
+  const handleFileChange = (e) => {
+    setFile(e.target.files[0]);
+  };
+
+  const handleUpload = async () => {
+    if (!file) {
+      setMessage('ファイルを選択してください。');
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch('/api/excel', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (response.ok) {
+        setMessage('ファイルが正常にアップロードされました。');
+      } else {
+        const errorData = await response.json();
+        setMessage(`アップロードに失敗しました: ${errorData.error || 'エラーが発生しました'}`);
+      }
+    } catch (error) {
+      console.error('Upload error:', error);
+      setMessage('アップロード中にエラーが発生しました。');
+    }
+  };
+
+  return (
+    <div>
+      <input type="file" onChange={handleFileChange} />
+      <button onClick={handleUpload}>アップロード</button>
+      {message && <p>{message}</p>}
+    </div>
+  );
+};
+
+export default FileUpload;
+```
+
+**8. Webページでコンポーネントを利用 (pages/index.js)**
+
+```jsx
+// pages/index.js
+import FileUpload from '../components/FileUpload';
+
+const Home = () => {
+  const handleDownload = async () => {
+    try {
+        const response = await fetch('/api/excel', {
+          method: 'GET',
+        });
+        if (response.ok) {
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'orders.xlsx';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          window.URL.revokeObjectURL(url);
+        } else {
+            console.error("Failed to download excel file");
+            const errorData = await response.json();
+          console.error(`Failed to download excel file ${errorData.error || 'エラーが発生しました'}`);
+        }
+      } catch (error) {
+        console.error("Error during download:", error);
+    }
+  };
+
+
+  return (
+    <div>
+      <h1>Excelファイルアップロード</h1>
+      <FileUpload />
+      <button onClick={handleDownload}>Excelダウンロード</button>
+    </div>
+  );
+};
+
+export default Home;
+```
+
+**実装のポイント**
+
+*   **機能1 (POST):**
+    *   WebページからExcelファイルをアップロードし、S3に保存、DBに登録、完了後にS3に移動します。
+*   **機能2 (GET):**
+    *   DBからデータを取得し、Excelファイルを作成し、レスポンスとしてダウンロードさせます。
+*   **共通:**
+    *   3層アーキテクチャ（MVC）で実装します。
+    *   S3操作、Excel操作、DBアクセスはそれぞれのサービス層で実装します。
+    *   エラーハンドリングを適切に行います。
+
+**使い方**
+
+1.  **WebページでExcelファイルをアップロード (機能1):**
+    *   `pages/index.js` の `FileUpload` コンポーネントを使って、Excelファイルを選択し、アップロードボタンをクリックします。
+    *   ファイルがS3の `uploads` プレフィックスにアップロードされ、Excelファイルの内容が解析され、PostgreSQLに登録されます。
+    *   登録完了後、S3上のファイルは `finished` プレフィックスに移動します。
+2.  **WebページでExcelファイルをダウンロード (機能2):**
+   *  `pages/index.js` のExcelダウンロードボタンをクリックすると、DBからデータを取得して作成されたExcelファイルがダウンロードされます。
+
+**注意点**
+
+*   Amazon S3のバケットとIAMの設定が必要です。
+*   PostgreSQLの設定が正しく行われているかを確認してください。
+*   `exceljs` のバージョンによっては、解析処理に調整が必要となる場合があります。
+*  上記コードはあくまでベースとなるもので、実際の要件に合わせて調整が必要な場合があります。
+
+この実装で、機能1と機能2の両方をカバーし、それぞれの要件を満たすことができています。
+もし実装中に問題が発生したり、追加の機能が必要になった場合は、お気軽にご質問ください。
