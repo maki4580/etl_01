@@ -1395,14 +1395,16 @@ GET /api/generateExcel
 
 Next.jsとExcelJSを使用して、以下の２つのAPIを実装する。
 機能1：Excelに入力された商品の注文数の一覧データをPostgreSQLに登録する。
-機能2：PostgreSQLから商品の注文状況の一覧をExcelに出力する。
+機能2：PostgreSQLから商品の注文状況の一覧をExcelに出力し、その署名付きURLを返却する。
 
 このプログラムは、3層アーキテクチャ（MVC）で作成する。
 機能1について、以下とする。
 ・WebページからExcelファイルを指定し、指定されたExcelファイルはAmazon S3のuploadsプレフィックスに配置する。
 ・uploadsプレフィックスに配置されたExcelファイルを取得してPostgreSQLにデータ登録する。
 ・データ登録後は、ExcelファイルをAmazon S3のfinishedプレフィックスに配置する。
+
 機能2について、以下とする。
+・出力するExcelは、Amazon S3に配置されたテンプレートExcelを使用する。
 ・出力する際、Excelのレコード数に応じて一覧の罫線を引く。
 ・出力するExcelは、特定の列のデータのみ入力可能とし、それ以外のセルはロックされている状態で出力する。
 ・出力するExcelの入力可能セルは背景色を薄黄色に設定する。
@@ -1412,342 +1414,422 @@ Next.jsとExcelJSを使用して、以下の２つのAPIを実装する。
 **ディレクトリ構成**
 
 ```
-my-excel-app/
+my-app/
 ├── components/
-│   └── FileUpload.js
+│   ├── UploadForm.tsx
+│   └── DownloadButton.tsx
 ├── controllers/
-│   └── excelController.js
+│   ├── orderController.ts
+│   └── s3Controller.ts
 ├── models/
-│   └── orderModel.js
-├── services/
-│   ├── excelService.js
-│   └── s3Service.js
+│   └── orderModel.ts
 ├── pages/
-│   └── api/
-│       └── excel.js
+│   ├── api/
+│   │   ├── orders.ts
+│   │   └── download.ts
+│   └── index.tsx
+├── services/
+│   ├── s3Service.ts
+│   └── excelService.ts
+├── styles/
+│   └── globals.css
+├── utils/
+│   └── database.ts
 ├── .env
-├── ...
-└── package.json
+├── next.config.js
+├── package.json
+├── tsconfig.json
+└── ...
 ```
 
-**1. 環境変数設定 (.env)**
+**環境変数 (.env)**
 
-```env
-DATABASE_URL=postgresql://your_user:your_password@your_host:your_port/your_database
-AWS_ACCESS_KEY_ID=your_access_key_id
-AWS_SECRET_ACCESS_KEY=your_secret_access_key
-AWS_REGION=your_region
-AWS_BUCKET_NAME=your_bucket_name
+```
+DATABASE_URL=postgres://user:password@host:port/database
+AWS_S3_REGION=your_region
+AWS_S3_ACCESS_KEY_ID=your_access_key_id
+AWS_S3_SECRET_ACCESS_KEY=your_secret_access_key
+AWS_S3_BUCKET_NAME=your_bucket_name
 ```
 
-**2. モデル (models/orderModel.js)**
+**モデル (models/orderModel.ts)**
 
-```javascript
-// models/orderModel.js
+```typescript
 import { Pool } from 'pg';
-import dotenv from 'dotenv';
+import { database } from '../utils/database';
 
-dotenv.config();
+export interface Order {
+  id: number;
+  product_name: string;
+  quantity: number;
+}
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
-export const createOrderTable = async () => {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS orders (
-        id SERIAL PRIMARY KEY,
-        product_name VARCHAR(255) NOT NULL,
-        quantity INTEGER NOT NULL,
-        order_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-  } finally {
-    client.release();
-  }
-};
-
-
-export const insertOrders = async (orders) => {
-  const client = await pool.connect();
-  try {
-      await createOrderTable();
-      const query = `
-      INSERT INTO orders (product_name, quantity) VALUES
-      ${orders.map((_, index) => `($${index * 2 + 1}, $${index * 2 + 2})`).join(',')}
-    `;
-    const values = orders.flatMap(order => [order.product_name, order.quantity]);
-    await client.query(query, values);
-  } finally {
+export const orderModel = {
+  async create(order: Omit<Order, 'id'>): Promise<Order> {
+    const client = await database.connect();
+    try {
+      const result = await client.query(
+        'INSERT INTO orders (product_name, quantity) VALUES ($1, $2) RETURNING id, product_name, quantity',
+        [order.product_name, order.quantity]
+      );
+      return result.rows[0];
+    } finally {
       client.release();
-  }
-};
-
-export const fetchOrders = async () => {
-  const client = await pool.connect();
-  try {
-    await createOrderTable();
-    const result = await client.query('SELECT id, product_name, quantity, order_date FROM orders');
-    return result.rows;
-  } finally {
-    client.release();
-  }
+    }
+  },
+  async getAll(): Promise<Order[]> {
+     const client = await database.connect();
+    try {
+      const result = await client.query('SELECT id, product_name, quantity FROM orders');
+      return result.rows;
+    } finally {
+      client.release();
+    }
+  },
 };
 ```
 
-**3. S3サービス (services/s3Service.js)**
+**コントローラ (controllers/orderController.ts)**
 
-```javascript
-// services/s3Service.js
-import AWS from 'aws-sdk';
+```typescript
+import { NextApiRequest, NextApiResponse } from 'next';
+import { orderModel, Order } from '../models/orderModel';
+import { s3Controller } from './s3Controller';
+import { excelService } from '../services/excelService';
 
-AWS.config.update({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.AWS_REGION,
-});
+export const orderController = {
+  async upload(req: NextApiRequest, res: NextApiResponse) {
+    try {
+      if (req.method !== 'POST') {
+        return res.status(405).end();
+      }
 
-const s3 = new AWS.S3();
-const bucketName = process.env.AWS_BUCKET_NAME;
+      const file = req.files?.file as any;
+      if (!file) {
+        return res.status(400).send('ファイルがありません。');
+      }
+      
+       const { key } = await s3Controller.uploadFile(file);
+       const fileData = await s3Controller.downloadFile(key);
 
-const uploadFileToS3 = async (file, prefix) => {
-    const params = {
-      Bucket: bucketName,
-      Key: `${prefix}/${file.originalname}`,
-      Body: file.buffer,
-    };
-    return s3.upload(params).promise();
-  };
+      const orders = await excelService.parseExcel(fileData);
+      
+       for(const order of orders) {
+        await orderModel.create(order)
+       }
 
-const getFileFromS3 = async (key) => {
-  const params = {
-    Bucket: bucketName,
-    Key: key,
-  };
-  return s3.getObject(params).promise();
+       const finishedKey = key.replace("uploads/", "finished/");
+       await s3Controller.copyFile(key, finishedKey)
+       await s3Controller.deleteFile(key);
+
+      res.status(200).send('Excelファイルがアップロードされ、データが登録されました。');
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      res.status(500).send('ファイルのアップロード中にエラーが発生しました。');
+    }
+  },
+  async download(req: NextApiRequest, res: NextApiResponse) {
+    try {
+      const orders = await orderModel.getAll();
+      const signedUrl = await excelService.generateExcelAndGetSignedUrl(orders);
+      res.status(200).json({ signedUrl });
+    } catch (error) {
+      console.error('Error generating Excel:', error);
+      res.status(500).send('Excelファイルの生成中にエラーが発生しました。');
+    }
+  },
 };
-
-const moveFileInS3 = async (sourceKey, destinationKey) => {
-  await s3.copyObject({
-    Bucket: bucketName,
-    CopySource: `/${bucketName}/${sourceKey}`,
-    Key: destinationKey,
-  }).promise();
-
-  await s3.deleteObject({
-    Bucket: bucketName,
-    Key: sourceKey,
-  }).promise();
-};
-
-export { uploadFileToS3, getFileFromS3, moveFileInS3 };
 ```
 
-**4. Excelサービス (services/excelService.js)**
+**コントローラ (controllers/s3Controller.ts)**
 
-```javascript
-// services/excelService.js
-import ExcelJS from 'exceljs';
+```typescript
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, CopyObjectCommand } from "@aws-sdk/client-s3";
+import { Readable } from 'stream';
 
-const INPUTABLE_COLUMN_INDEX = 2;
-const HEADER = ["ID", "商品名", "注文数", "注文日時"];
-
-const parseExcelData = async (buffer) => {
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(buffer);
-    const worksheet = workbook.getWorksheet(1);
-    const rows = [];
-    worksheet.eachRow((row, rowNumber) => {
-      if (rowNumber === 1) return; // ヘッダー行をスキップ
-       const rowValues = row.values;
-        rows.push({
-            product_name: rowValues[1],
-            quantity: rowValues[2],
-        });
-    });
-    return rows;
-};
-
-
-const createExcelFromData = async (orders) => {
-  const workbook = new ExcelJS.Workbook();
-  const worksheet = workbook.addWorksheet('注文一覧');
-  worksheet.columns = HEADER.map(header => ({ header, key: header.toLowerCase() }));
-  worksheet.addRow(HEADER);
-
-  orders.forEach(order => {
-    worksheet.addRow({
-      id: order.id,
-      product_name: order.product_name,
-      quantity: order.quantity,
-      order_date: order.order_date
-    });
+const s3Client = new S3Client({
+    region: process.env.AWS_S3_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_S3_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.AWS_S3_SECRET_ACCESS_KEY!,
+    },
   });
 
-  // 行数に合わせて罫線を設定
-  const lastRow = worksheet.lastRow.number;
-    for (let i = 1; i <= lastRow; i++) {
-        worksheet.getRow(i).eachCell((cell) => {
-            cell.border = {
-                top: { style: 'thin' },
-                left: { style: 'thin' },
-                bottom: { style: 'thin' },
-                right: { style: 'thin' }
-            };
+const bucketName = process.env.AWS_S3_BUCKET_NAME!
+
+export const s3Controller = {
+    async uploadFile(file: any) {
+        const key = `uploads/${Date.now()}-${file.originalFilename}`;
+        const command = new PutObjectCommand({
+          Bucket: bucketName,
+          Key: key,
+          Body: file.data,
+          ContentType: file.type
         });
-    }
+        await s3Client.send(command);
+        return { key };
+      },
 
+     async downloadFile(key: string) {
+          const command = new GetObjectCommand({
+            Bucket: bucketName,
+            Key: key
+          });
+          const response = await s3Client.send(command);
+          return response.Body as Readable;
+      },
 
-  // 特定列のみ入力可能にし、背景色を設定、その他をロック
-  worksheet.eachRow({ includeEmpty: true }, (row) => {
-    row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-      if (colNumber === INPUTABLE_COLUMN_INDEX) {
-        cell.fill = {
+      async deleteFile(key: string) {
+         const command = new DeleteObjectCommand({
+            Bucket: bucketName,
+            Key: key
+          });
+        await s3Client.send(command);
+        return;
+      },
+      async copyFile(sourceKey: string, destinationKey: string) {
+            const command = new CopyObjectCommand({
+              Bucket: bucketName,
+              CopySource: `${bucketName}/${sourceKey}`,
+                Key: destinationKey
+          });
+          await s3Client.send(command);
+         return;
+      }
+}
+```
+
+**サービス (services/excelService.ts)**
+
+```typescript
+import ExcelJS from 'exceljs';
+import { orderModel, Order } from '../models/orderModel';
+import { s3Service } from '../services/s3Service';
+
+export const excelService = {
+    async parseExcel(fileData: any): Promise<Omit<Order, 'id'>[]> {
+    return new Promise((resolve, reject) => {
+        const chunks: any[] = [];
+        fileData.on("data", (chunk: any) => {
+            chunks.push(chunk);
+        });
+
+        fileData.on("end", async () => {
+            try {
+                const buffer = Buffer.concat(chunks);
+                const workbook = new ExcelJS.Workbook();
+                await workbook.xlsx.load(buffer);
+                const worksheet = workbook.getWorksheet(1);
+
+                 const headers: string[] = [];
+                  worksheet.getRow(1).eachCell((cell) => {
+                     headers.push(cell.text);
+                  });
+
+                const orders: Omit<Order, 'id'>[] = [];
+                worksheet.eachRow((row, rowNumber) => {
+                    if (rowNumber === 1) return; 
+
+                     const order: Omit<Order, 'id'> = {};
+                    row.eachCell((cell, colNumber) => {
+                        const header = headers[colNumber - 1]
+                        if(header === "product_name"){
+                             order.product_name = cell.text;
+                        } else if (header === "quantity"){
+                             order.quantity = Number(cell.value);
+                        }
+                    });
+                      orders.push(order);
+                });
+                  resolve(orders);
+            } catch (error) {
+                reject(error);
+            }
+          });
+           fileData.on("error", (error: any) => {
+                reject(error);
+            });
+    });
+  },
+
+  async generateExcelAndGetSignedUrl(orders: Order[]): Promise<string> {
+      const templateKey = "templates/order_template.xlsx"
+      const templateFile = await s3Service.downloadFile(templateKey)
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(await templateFile.transformToBuffer());
+      const worksheet = workbook.getWorksheet(1);
+
+    orders.forEach((order, index) => {
+        const rowNumber = index + 2;
+         worksheet.getCell(`A${rowNumber}`).value = order.product_name;
+        worksheet.getCell(`B${rowNumber}`).value = order.quantity;
+      });
+       // 罫線を引く
+        const lastRow = orders.length + 1;
+        worksheet.getCell(`A1:B${lastRow}`).border = {
+             top: { style: "thin", color: { argb: "FF000000" } },
+             left: { style: "thin", color: { argb: "FF000000" } },
+             bottom: { style: "thin", color: { argb: "FF000000" } },
+             right: { style: "thin", color: { argb: "FF000000" } },
+        };
+      // 特定の列のみ入力可能にする
+      worksheet.getColumn("B").eachCell((cell) => {
+        cell.protection = { locked: false };
+         cell.fill = {
           type: 'pattern',
           pattern: 'solid',
           fgColor: { argb: 'FFFFFFE0' },
         };
-        cell.protection = { locked: false };
-      } else {
-        cell.protection = { locked: true };
-      }
-    });
-  });
+      });
 
-  // シートを保護
-  worksheet.protect('password', {
-    selectLockedCells: true,
-    selectUnlockedCells: true,
-    formatCells: false,
-    formatColumns: false,
-    formatRows: false,
-    insertColumns: false,
-    insertRows: false,
-    insertHyperlinks: false,
-    deleteColumns: false,
-    deleteRows: false,
-    sort: false,
-    autoFilter: false,
-    pivotTables: false,
-    objects: false,
-    scenarios: false,
-  });
+    worksheet.protect('password', {
+        selectLockedCells: true,
+        selectUnlockedCells: true,
+      });
 
     const buffer = await workbook.xlsx.writeBuffer();
-    return buffer;
+    const key = `outputs/${Date.now()}-output.xlsx`;
+    await s3Service.uploadBuffer(key, buffer)
+    const signedUrl = await s3Service.generatePresignedUrl(key);
+      return signedUrl;
+  },
 };
-
-export { parseExcelData, createExcelFromData };
 ```
 
-**5. コントローラ (controllers/excelController.js)**
+**サービス (services/s3Service.ts)**
 
-```javascript
-// controllers/excelController.js
-import { insertOrders, fetchOrders } from '../models/orderModel';
-import { getFileFromS3, uploadFileToS3, moveFileInS3 } from '../services/s3Service';
-import { parseExcelData, createExcelFromData } from '../services/excelService';
+```typescript
+import { S3Client, PutObjectCommand, GetObjectCommand,  } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { Readable } from 'stream';
 
-const uploadAndProcessExcel = async (req, res) => {
-  try {
-      if (!req.file) {
-          return res.status(400).json({ message: 'No file uploaded' });
-      }
-
-      await uploadFileToS3(req.file, 'uploads');
-      const fileKey = `uploads/${req.file.originalname}`;
-      const s3Object = await getFileFromS3(fileKey);
-      const excelData = await parseExcelData(s3Object.Body);
-
-      await insertOrders(excelData);
-      const destinationKey = `finished/${req.file.originalname}`;
-      await moveFileInS3(fileKey, destinationKey);
-
-
-      res.status(200).json({ message: 'File uploaded and processed successfully' });
-  } catch (error) {
-    console.error('Error processing file:', error);
-    res.status(500).json({ error: 'Failed to process file' });
-  }
-};
-
-const getExcel = async (req, res) => {
-  try {
-    const orders = await fetchOrders();
-      if (!orders || orders.length === 0) {
-        return res.status(404).json({ message: "No orders found" });
-    }
-    const buffer = await createExcelFromData(orders);
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="orders.xlsx"');
-    res.send(buffer);
-  } catch (error) {
-    console.error('Error creating Excel:', error);
-    res.status(500).json({ error: 'Failed to create Excel' });
-  }
-};
-
-
-export { uploadAndProcessExcel, getExcel };
-```
-
-**6. API エンドポイント (pages/api/excel.js)**
-
-```javascript
-// pages/api/excel.js
-import { uploadAndProcessExcel, getExcel } from '../../controllers/excelController';
-import multer from 'multer';
-import nextConnect from 'next-connect';
-
-const upload = multer({ storage: multer.memoryStorage() });
-const uploadMiddleware = upload.single('file');
-
-
-const handler = nextConnect({
-    onError: (err, req, res, next) => {
-        console.error(err.stack);
-        res.status(500).json({ error: 'Something broke!'});
+const s3Client = new S3Client({
+    region: process.env.AWS_S3_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_S3_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.AWS_S3_SECRET_ACCESS_KEY!,
     },
-    onNoMatch: (req, res) => {
-        res.status(404).json({ error: 'Not found' });
-    }
-})
-.use(uploadMiddleware)
-.post(async (req, res) => {
-    await uploadAndProcessExcel(req,res);
-})
-.get(async (req, res) => {
-    await getExcel(req,res);
-});
+  });
 
-export default handler;
+const bucketName = process.env.AWS_S3_BUCKET_NAME!
 
+export const s3Service = {
+   async downloadFile(key: string) {
+        const command = new GetObjectCommand({
+          Bucket: bucketName,
+          Key: key
+        });
+        const response = await s3Client.send(command);
+        return response.Body as Readable;
+    },
+   async uploadBuffer(key: string, buffer: Buffer) {
+       const command = new PutObjectCommand({
+           Bucket: bucketName,
+           Key: key,
+           Body: buffer,
+       });
+        await s3Client.send(command);
+        return
+   },
+  async generatePresignedUrl(key: string): Promise<string> {
+        const command = new GetObjectCommand({
+          Bucket: bucketName,
+          Key: key,
+        });
+
+       return await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+  },
+};
+```
+
+**API (pages/api/orders.ts)**
+
+```typescript
+import { NextApiRequest, NextApiResponse } from 'next';
+import { orderController } from '../../controllers/orderController';
+import formidable from 'formidable';
+import { promises as fs } from 'fs';
 
 export const config = {
-    api: {
-        bodyParser: false,
-    }
+  api: {
+    bodyParser: false,
+  },
+};
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  const form = formidable({ multiples: false });
+  return new Promise((resolve, reject) => {
+    form.parse(req, async (err, fields, files) => {
+        if (err) {
+          console.error(err);
+          res.status(500).send('Form parsing error');
+          return reject(err);
+        }
+         req.files = files;
+        await orderController.upload(req, res);
+        resolve(res)
+    });
+   });
 }
 ```
 
-**7. ファイルアップロードコンポーネント (components/FileUpload.js)**
+**API (pages/api/download.ts)**
 
-```jsx
-// components/FileUpload.js
-import { useState } from 'react';
+```typescript
+import { NextApiRequest, NextApiResponse } from 'next';
+import { orderController } from '../../controllers/orderController';
 
-const FileUpload = () => {
-  const [file, setFile] = useState(null);
-  const [message, setMessage] = useState('');
+export default async function handler(
+    req: NextApiRequest,
+    res: NextApiResponse
+  ) {
+    if (req.method !== "GET"){
+      return res.status(405).end();
+    }
+    await orderController.download(req, res);
+}
+```
 
-  const handleFileChange = (e) => {
-    setFile(e.target.files[0]);
+**Webページ (pages/index.tsx)**
+
+```typescript
+import React, { useState } from 'react';
+import UploadForm from '../components/UploadForm';
+import DownloadButton from '../components/DownloadButton';
+
+const IndexPage: React.FC = () => {
+  return (
+    <div>
+      <h1>Excel Import/Export</h1>
+      <UploadForm />
+      <DownloadButton />
+    </div>
+  );
+};
+
+export default IndexPage;
+```
+
+**コンポーネント (components/UploadForm.tsx)**
+
+```typescript
+import React, { useState } from 'react';
+
+const UploadForm: React.FC = () => {
+    const [file, setFile] = useState<File | null>(null);
+    const [message, setMessage] = useState('');
+
+    const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files && event.target.files.length > 0) {
+        setFile(event.target.files[0]);
+      }
   };
 
-  const handleUpload = async () => {
-    if (!file) {
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+     if (!file) {
       setMessage('ファイルを選択してください。');
       return;
     }
@@ -1756,106 +1838,253 @@ const FileUpload = () => {
     formData.append('file', file);
 
     try {
-      const response = await fetch('/api/excel', {
-        method: 'POST',
-        body: formData,
+      const response = await fetch('/api/orders', {
+          method: 'POST',
+          body: formData,
       });
 
       if (response.ok) {
-        setMessage('ファイルが正常にアップロードされました。');
+          setMessage('ファイルがアップロードされました。');
       } else {
-        const errorData = await response.json();
-        setMessage(`アップロードに失敗しました: ${errorData.error || 'エラーが発生しました'}`);
+           setMessage('ファイルのアップロードに失敗しました。');
       }
     } catch (error) {
-      console.error('Upload error:', error);
-      setMessage('アップロード中にエラーが発生しました。');
+       setMessage('エラーが発生しました。');
     }
   };
 
   return (
-    <div>
-      <input type="file" onChange={handleFileChange} />
-      <button onClick={handleUpload}>アップロード</button>
-      {message && <p>{message}</p>}
-    </div>
+    <form onSubmit={handleSubmit}>
+        <input type="file" onChange={handleFileChange} />
+        <button type="submit">アップロード</button>
+         {message && <p>{message}</p>}
+    </form>
   );
 };
 
-export default FileUpload;
+export default UploadForm;
 ```
 
-**8. Webページでコンポーネントを利用 (pages/index.js)**
+**コンポーネント (components/DownloadButton.tsx)**
 
-```jsx
-// pages/index.js
-import FileUpload from '../components/FileUpload';
+```typescript
+import React, { useState } from 'react';
 
-const Home = () => {
+const DownloadButton: React.FC = () => {
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+
   const handleDownload = async () => {
-    try {
-        const response = await fetch('/api/excel', {
-          method: 'GET',
-        });
-        if (response.ok) {
-          const blob = await response.blob();
-          const url = window.URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'orders.xlsx';
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          window.URL.revokeObjectURL(url);
+     try {
+          const response = await fetch('/api/download');
+         if (response.ok) {
+            const data = await response.json();
+            setDownloadUrl(data.signedUrl);
         } else {
-            console.error("Failed to download excel file");
-            const errorData = await response.json();
-          console.error(`Failed to download excel file ${errorData.error || 'エラーが発生しました'}`);
+           console.error("Failed to fetch download URL")
         }
-      } catch (error) {
-        console.error("Error during download:", error);
-    }
+       } catch (error) {
+         console.error("Failed to fetch download URL", error)
+      }
   };
-
 
   return (
     <div>
-      <h1>Excelファイルアップロード</h1>
-      <FileUpload />
-      <button onClick={handleDownload}>Excelダウンロード</button>
+        <button onClick={handleDownload}>ダウンロード</button>
+        {downloadUrl && (
+          <a href={downloadUrl} target="_blank" rel="noopener noreferrer">
+            ダウンロードリンク
+          </a>
+        )}
     </div>
   );
 };
 
-export default Home;
+export default DownloadButton;
 ```
 
-**実装のポイント**
+**utils/database.ts**
 
-*   **機能1 (POST):**
-    *   WebページからExcelファイルをアップロードし、S3に保存、DBに登録、完了後にS3に移動します。
-*   **機能2 (GET):**
-    *   DBからデータを取得し、Excelファイルを作成し、レスポンスとしてダウンロードさせます。
-*   **共通:**
-    *   3層アーキテクチャ（MVC）で実装します。
-    *   S3操作、Excel操作、DBアクセスはそれぞれのサービス層で実装します。
-    *   エラーハンドリングを適切に行います。
+```typescript
+import { Pool } from 'pg';
 
-**使い方**
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
 
-1.  **WebページでExcelファイルをアップロード (機能1):**
-    *   `pages/index.js` の `FileUpload` コンポーネントを使って、Excelファイルを選択し、アップロードボタンをクリックします。
-    *   ファイルがS3の `uploads` プレフィックスにアップロードされ、Excelファイルの内容が解析され、PostgreSQLに登録されます。
-    *   登録完了後、S3上のファイルは `finished` プレフィックスに移動します。
-2.  **WebページでExcelファイルをダウンロード (機能2):**
-   *  `pages/index.js` のExcelダウンロードボタンをクリックすると、DBからデータを取得して作成されたExcelファイルがダウンロードされます。
+export const database = {
+  connect: () => {
+    return pool.connect();
+  },
+};
+```
 
-**注意点**
+**手順**
 
-*   Amazon S3のバケットとIAMの設定が必要です。
-*   PostgreSQLの設定が正しく行われているかを確認してください。
-*   `exceljs` のバージョンによっては、解析処理に調整が必要となる場合があります。
-*  上記コードはあくまでベースとなるもので、実際の要件に合わせて調整が必要な場合があります。
+1.  **PostgreSQLデータベースの設定:**
+    *   PostgreSQLデータベースをセットアップし、`orders` テーブルを作成してください。
+    ```sql
+    CREATE TABLE orders (
+        id SERIAL PRIMARY KEY,
+        product_name VARCHAR(255) NOT NULL,
+        quantity INTEGER NOT NULL
+    );
+    ```
+2.  **AWS S3の設定:**
+    *   AWS S3バケットを作成し、AWSの認証情報を`.env`ファイルに設定してください。
+        * バケット内に`uploads`, `finished`, `templates`, `outputs` のプレフィックスを用意してください。
+    *   テンプレートExcelファイルを `templates` プレフィックスにアップロードしてください（例: `order_template.xlsx`）。
 
-この実装で、機能1と機能2の両方をカバーし、それぞれの要件を満たすことができています。
-もし実装中に問題が発生したり、追加の機能が必要になった場合は、お気軽にご質問ください。
+3.  **必要なnpmパッケージをインストール**
+
+    ```bash
+    npm install exceljs pg @aws-sdk/client-s3 @aws-sdk/s3-request-presigner formidable
+    npm install -D @types/node @types/formidable
+    ```
+4.  **コードを配置:** 上記のコードを適切な場所にコピーしてください。
+5.  **開発サーバーを起動:** `npm run dev` で開発サーバーを起動します。
+6.  **ブラウザでアクセス:** `http://localhost:3000` をブラウザで開いてください。
+
+**補足**
+
+*   上記コードはTypeScriptで記述しています。
+*   エラー処理は必要最小限に留めてあります。本番環境では適切なエラーハンドリングを実装してください。
+*   Excelのテンプレートファイルは `templates/order_template.xlsx` という名前でS3に配置してください。
+*   `excelService` の `generateExcelAndGetSignedUrl` 内でテンプレートの読み込み部分を `buffer` で読み込む形に修正しました。これにより、S3からダウンロードしたファイルがストリーム型になっているため、bufferへ変換することでExceljsで扱えるようになります。
+* `s3Controller`  , `s3Service`  で`AWS SDK for JavaScript v3` に書き換えました。
+* Formidableを導入し、`req.files` でファイルが取得できるようにしました。
+* 型定義を修正しました。
+* 依存関係を修正しました。
+
+**このプログラムを実行することで、以下の機能が実現します。**
+
+1.  **機能1:**
+    *   WebページからExcelファイルをアップロードし、S3に保存されます。
+    *   S3に保存されたExcelファイルを解析し、データベースに登録されます。
+    *   登録後、S3上のExcelファイルが`finished`プレフィックスに移動します。
+2.  **機能2:**
+    *   データベースの注文データをS3に配置されたテンプレートExcelファイルに書き込みます。
+    *   罫線を引き、特定のセルのみ入力可能、その他のセルをロックした状態でExcelファイルを作成します。
+    *   作成したExcelファイルの署名付きURLを返却します。
+
+このコードをベースに、ご自身の要件に合わせてカスタマイズしてください。
+
+-------
+
+# API 仕様書
+
+## 概要
+
+このドキュメントは、Next.js、ExcelJS、PostgreSQL、Amazon S3を使用して実装された、Excelファイルを用いた注文データ管理APIの仕様を記述します。
+
+## エンドポイント
+
+### 1. ExcelファイルアップロードAPI
+
+**エンドポイント:** `/api/orders`
+
+**メソッド:** `POST`
+
+**説明:**
+WebページからアップロードされたExcelファイルをAmazon S3に保存し、そのデータをPostgreSQLデータベースに登録します。
+
+**リクエスト:**
+*   **Content-Type:** `multipart/form-data`
+*   **ボディ:**
+    *   `file`: アップロードするExcelファイル
+
+**レスポンス:**
+
+*   **200 OK:**
+    *   **ボディ:** `"Excelファイルがアップロードされ、データが登録されました。"`
+*   **400 Bad Request:**
+    *   **ボディ:** `"ファイルがありません。"`
+*   **405 Method Not Allowed:**
+    *   **ボディ:** (エラーメッセージなし)
+*   **500 Internal Server Error:**
+    *   **ボディ:** `"ファイルのアップロード中にエラーが発生しました。"`
+
+**補足:**
+*   アップロードされたExcelファイルは、Amazon S3の`uploads/`プレフィックスに保存されます。
+*   データベース登録後、ファイルは`finished/`プレフィックスに移動します。
+
+**リクエスト例:**
+
+```
+POST /api/orders HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="orders.xlsx"
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+...（ファイルバイナリデータ）...
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+```
+
+### 2. ExcelファイルダウンロードAPI
+
+**エンドポイント:** `/api/download`
+
+**メソッド:** `GET`
+
+**説明:**
+PostgreSQLデータベースに登録された注文データをもとに、テンプレートExcelファイルを加工してS3にアップロードし、その署名付きURLを返します。
+
+**リクエスト:**
+
+*   **ヘッダー:** なし
+*   **ボディ:** なし
+
+**レスポンス:**
+
+*   **200 OK:**
+    *   **ボディ:**
+        ```json
+        {
+          "signedUrl": "https://your-s3-bucket.s3.your-region.amazonaws.com/outputs/1678886400-output.xlsx?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=YOUR_ACCESS_KEY%2F20230315%2Fyour-region%2Fs3%2Faws4_request&X-Amz-Date=20230315T120000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=..."
+        }
+        ```
+*   **405 Method Not Allowed:**
+    *   **ボディ:** (エラーメッセージなし)
+*   **500 Internal Server Error:**
+    *   **ボディ:** `"Excelファイルの生成中にエラーが発生しました。"`
+
+**補足:**
+*   出力するExcelファイルは、S3の`templates/`プレフィックスに配置されたテンプレートファイルを使用します。
+*   出力するExcelファイルには、レコード数に応じた罫線が引かれ、特定の列（数量）のみ編集可能で、その他はロックされた状態になります。
+*  入力可能なセルには薄い黄色い背景色が設定されます。
+*   生成されたExcelファイルはS3の`outputs/`プレフィックスに保存されます。
+*   レスポンスで返される署名付きURLは、一時的なアクセス権限を持つURLです。
+
+**レスポンス例:**
+
+```json
+{
+  "signedUrl": "https://your-s3-bucket.s3.your-region.amazonaws.com/outputs/1678886400-output.xlsx?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=YOUR_ACCESS_KEY%2F20230315%2Fyour-region%2Fs3%2Faws4_request&X-Amz-Date=20230315T120000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=..."
+}
+```
+
+## データモデル
+
+### Order
+
+| カラム名        | データ型   | 説明              |
+| ------------- | -------- | --------------- |
+| `id`          | `SERIAL` | プライマリキー    |
+| `product_name`| `VARCHAR` | 商品名           |
+| `quantity`    | `INTEGER`| 注文数        |
+
+## 認証
+
+このAPIは認証を必要としません。
+
+## 補足
+
+*   エラーレスポンスは、より詳細な情報を返すように変更される可能性があります。
+*   APIのエンドポイントやレスポンスの構造は、今後の変更によって変わることがあります。
+*   S3のバケット名、AWSリージョン、認証情報は、環境変数で管理されます。
+*   PostgreSQLの接続情報は、環境変数で管理されます。
+
+---
+
+このドキュメントは、APIの利用を始めるためのガイダンスとして役立ててください。
